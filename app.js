@@ -5,11 +5,14 @@ const API = 'https://www.mvg.de/api/bgw-pt/v3';
 const TRANSPORT_TYPES = 'SCHIFF,RUFTAXI,BAHN,UBAHN,TRAM,SBAHN,BUS,REGIONAL_BUS';
 const REFRESH_MS = 30_000;
 const MESSAGES_REFRESH_MS = 5 * 60_000;
-const ALT_STOPS_AHEAD = 3;          // an so vielen kommenden Halten Umsteigen prüfen
+const ALT_STOPS_AHEAD = 12;         // an höchstens so vielen kommenden Halten Umsteigen prüfen
+const ALT_PARALLEL = 4;             // gleichzeitige Anfragen (MVG-Server schonen)
+const ALT_SHOWN = 5;                // so viele Optionen sofort zeigen, Rest per "Mehr"
 const AUTO_ALT_DELAY_MIN = 5;       // ab dieser Verspätung automatisch Alternativen prüfen
 const MAX_GPS_DISTANCE_M = 1500;    // weiter weg = nicht auf dieser Strecke
 const AT_STOP_M = 250;              // so nah = "ich bin am Halt"
-const MIN_USEFUL_GAIN_MIN = -2;     // langsamere Alternativen nur bis hierhin zeigen
+const MIN_TRANSFER_MIN = 2;         // kürzere Umstiege (Gleis zu Gleis) sind unrealistisch
+const MAX_SLOWER_MIN = 30;          // deutlich langsamere Optionen gar nicht zeigen
 const TYPE_COLORS = { SBAHN: '#408335', UBAHN: '#0065ae', TRAM: '#d82020', BUS: '#00586a', REGIONAL_BUS: '#00586a', BAHN: '#555', SCHIFF: '#0a7ea4', RUFTAXI: '#777' };
 const DEFAULT_FAVORITES = [{
   from: { id: 'de:09184:2260', name: 'Aying' },
@@ -241,34 +244,76 @@ const htmlToText = (html) => {
 
 // ---------- Alternativen ----------
 
-// Für jeden der nächsten Halte: Was bringt Aussteigen dort, und was kostet es, den Anschluss zu verpassen?
-async function computeAlternatives(conn, pos) {
+// Wie bei Google: alle Verbindungen ab den kommenden Halten sammeln und nach Ankunft sortieren.
+// Zu jeder Option: wo aussteigen, wie viel Umstiegszeit, und was es kostet, den Anschluss zu verpassen.
+async function computeAlternatives(conn, pos, onProgress = () => {}) {
   const part = conn.parts[pos.partIdx];
   const stops = legStops(part);
   const dest = conn.parts.at(-1).to;
   const ahead = stops.slice(pos.seg + 1).filter((s) => s.stationGlobalId !== dest.stationGlobalId).slice(0, ALT_STOPS_AHEAD);
+  // Gleiche Linie in gleicher Richtung ist keine Alternative (das ist dein Zug oder der nächste),
+  // außer dein Zug fällt aus.
+  const isSameLine = (o) => {
+    const t = o.parts.find(isTransit);
+    return t && t.line.label === part.line.label && t.line.destination === part.line.destination;
+  };
 
-  const results = await Promise.all(ahead.map(async (stop) => {
+  const perStop = async (stop) => {
     const reach = arrTime(stop);
     let options;
     try { options = await fetchRoutes(stop.stationGlobalId, dest.stationGlobalId, new Date(reach)); }
-    catch (e) { return { stop, error: e.message }; }
-    // Gleiche Linie in gleicher Richtung ist keine Alternative (das ist dein Zug oder der nächste),
-    // außer dein Zug fällt aus.
-    const isSameLine = (o) => {
-      const t = o.parts.find(isTransit);
-      return t && t.line.label === part.line.label && t.line.destination === part.line.destination;
+    catch { return { stop, failed: true, options: [] }; }
+    const others = options.filter((o) => !o.cancelled && o.firstTransitDepart >= reach + MIN_TRANSFER_MIN * 60_000 && (conn.cancelled || !isSameLine(o)));
+    return {
+      stop,
+      options: others.map((o) => {
+        // Verpasst man den ersten Anschluss, nimmt man die beste Verbindung, die später losfährt.
+        const later = others.filter((x) => x.firstTransitDepart > o.firstTransitDepart);
+        const fallback = later.length ? later.reduce((a, b) => (b.arrive < a.arrive ? b : a)) : null;
+        return { exit: stop, reach, conn: o, fallback, buffer: o.firstTransitDepart - reach };
+      }),
     };
-    const others = options.filter((o) => !o.cancelled && o.firstTransitDepart >= reach && (conn.cancelled || !isSameLine(o)));
-    if (!others.length) return { stop, best: null };
-    const best = others.reduce((a, b) => (b.arrive < a.arrive ? b : a));
-    // Verpasst man den ersten Anschluss, nimmt man die beste Verbindung, die später losfährt.
-    const later = others.filter((o) => o.firstTransitDepart > best.firstTransitDepart);
-    const fallback = later.length ? later.reduce((a, b) => (b.arrive < a.arrive ? b : a)) : null;
-    return { stop, reach, best, fallback };
-  }));
-  return { base: conn, results };
+  };
+
+  const results = [];
+  for (let i = 0; i < ahead.length; i += ALT_PARALLEL) {
+    onProgress(Math.min(i + ALT_PARALLEL, ahead.length), ahead.length);
+    results.push(...await Promise.all(ahead.slice(i, i + ALT_PARALLEL).map(perStop)));
+  }
+
+  const lineSig = (o) => o.conn.parts.filter(isTransit).map((p) => p.line.label).join('>');
+  const plannedRest = conn.parts.slice(pos.partIdx + 1).filter(isTransit).map((p) => p.line.label).join('>');
+  const stopIdx = new Map(stops.map((s, i) => [s.stationGlobalId, i]));
+  // Unsinnig: zurück zu Halten, die mein Zug schon vor dem Ausstieg passiert hat,
+  // oder nur die geplante Verbindung mit anderem Umstiegshalt.
+  const pointless = (opt) => {
+    const exitIdx = stopIdx.get(opt.exit.stationGlobalId);
+    const goesBack = opt.conn.parts.some((p) => legStops(p).some((s) => stopIdx.get(s.stationGlobalId) < exitIdx));
+    const samePlan = lineSig(opt) === plannedRest && minutes(opt.conn.arrive) === minutes(conn.arrive);
+    return goesBack || samePlan;
+  };
+  // Gleicher Ausstieg + gleiche Linien = derselbe Weg im nächsten Takt: nur den frühesten behalten
+  // (den Takt zeigt "verpasst").
+  const byRoute = new Map();
+  for (const opt of results.flatMap((r) => r.options).filter((o) => !pointless(o))) {
+    const sig = `${opt.exit.stationGlobalId}|${lineSig(opt)}`;
+    const prev = byRoute.get(sig);
+    if (!prev || opt.conn.arrive < prev.conn.arrive) byRoute.set(sig, opt);
+  }
+  // Gleiche Linien + gleiche Ankunft von verschiedenen Halten: den mit mehr Umstiegszeit behalten.
+  const bySignature = new Map();
+  for (const opt of byRoute.values()) {
+    const sig = `${lineSig(opt)}|${minutes(opt.conn.arrive)}`;
+    const prev = bySignature.get(sig);
+    if (!prev || opt.buffer > prev.buffer) bySignature.set(sig, opt);
+  }
+  const options = [...bySignature.values()]
+    .filter((o) => conn.cancelled || o.conn.arrive - conn.arrive <= MAX_SLOWER_MIN * 60_000)
+    .sort((a, b) => a.conn.arrive - b.conn.arrive || transfers(a.conn) - transfers(b.conn));
+  return { base: conn, line: part.line, options, checked: ahead.length, failed: results.filter((r) => r.failed).map((r) => r.stop.name) };
 }
+
+const transfers = (conn) => Math.max(0, conn.parts.filter(isTransit).length - 1);
 
 // ---------- Zustand ----------
 
@@ -441,7 +486,9 @@ async function runAlternatives() {
   const pos = locate(conn, state.gps, Date.now());
   state.altKey = `${conn.key}|${pos.partIdx}|${pos.seg}`;
   $('#alternatives').innerHTML = '<span class="muted">Rechne …</span>';
-  state.alternatives = await computeAlternatives(conn, pos);
+  state.alternatives = await computeAlternatives(conn, pos, (done, total) => {
+    $('#alternatives').innerHTML = `<span class="muted">Prüfe Halte … ${done}/${total}</span>`;
+  });
   renderAlternatives();
 }
 
@@ -514,37 +561,55 @@ function noticeHtml(m) {
   </div>`;
 }
 
+function chips(conn) {
+  return conn.parts.map((p) => (isTransit(p) ? badge(p.line) : '<span class="walk">🚶</span>')).join('<span class="sep">›</span>');
+}
+
 function legsText(conn) {
   return conn.parts.filter(isTransit).map((p) => `${esc(p.line.label)} ${fmtTime(depTime(p.from))} ab ${esc(p.from.name)}`).join(' · ');
 }
 
-function renderAlternatives() {
+function troubleBadge(conn) {
+  const { incidents } = relevantMessages(state.messages, conn, Date.now());
+  if (conn.cancelled) return '<div class="trouble">Fällt aus</div>';
+  return incidents.length ? `<div class="trouble">⚠ Störung: ${esc(htmlToText(incidents[0].title ?? incidents[0].text))}</div>` : '';
+}
+
+function optionHtml(o, base) {
+  const gain = minutes(base.arrive - o.conn.arrive);
+  const gainText = gain > 0 ? `${gain} min schneller` : gain < 0 ? `${-gain} min später` : 'gleich schnell';
+  const buffer = minutes(o.buffer);
+  const missText = o.fallback
+    ? `verpasst: an ${fmtTime(o.fallback.arrive)} (+${minutes(o.fallback.arrive - o.conn.arrive)} min)`
+    : 'verpasst: keine spätere Verbindung';
+  const n = transfers(o.conn) + 1;   // +1: aus dem jetzigen Zug aussteigen
+  return `<div class="alt ${gain > 0 ? 'better' : ''}">
+    <div class="row between"><span class="head">an ${fmtTime(o.conn.arrive)}</span><span class="${gain > 0 ? 'ontime' : 'muted'}">${gainText}</span></div>
+    <div class="chips">${badge(state.alternatives.line)}<span class="sep">›</span>${chips(o.conn)}</div>
+    <div class="legs">Aussteigen in <b>${esc(o.exit.name)}</b> (${fmtTime(o.reach)}) · ${legsText(o.conn)} · ${n} Umstieg${n > 1 ? 'e' : ''}</div>
+    <div class="risk">Umstiegszeit ${buffer} min${buffer <= MIN_TRANSFER_MIN + 1 ? ' – knapp!' : ''} · ${missText}</div>
+    ${troubleBadge(o.conn)}
+  </div>`;
+}
+
+function renderAlternatives(showAll = false) {
   const alt = state.alternatives;
   if (!alt) return;
   const base = alt.base;
-  const stayLabel = base.parts.filter(isTransit).length > 1 ? 'Wie geplant weiterfahren' : 'Sitzen bleiben';
-  const html = [`<div class="alt stay"><div class="head">${stayLabel}: an ${fmtTime(base.arrive)}</div></div>`];
-  let any = false;
-  for (const r of alt.results) {
-    if (r.error) { html.push(`<div class="alt muted">${esc(r.stop.name)}: ${esc(r.error)}</div>`); continue; }
-    if (!r.best) continue;
-    const gain = minutes(base.arrive - r.best.arrive);
-    if (!base.cancelled && gain < MIN_USEFUL_GAIN_MIN) continue;
-    any = true;
-    const buffer = minutes(r.best.firstTransitDepart - r.reach);
-    const gainText = gain > 0 ? `${gain} min schneller` : gain < 0 ? `${-gain} min langsamer` : 'gleich schnell';
-    const missText = r.fallback
-      ? `Verpasst du den Anschluss: an ${fmtTime(r.fallback.arrive)} (+${minutes(r.fallback.arrive - r.best.arrive)} min)`
-      : 'Verpasst du den Anschluss: keine spätere Verbindung gefunden';
-    html.push(`<div class="alt ${gain > 0 ? 'better' : ''}">
-      <div class="head">In ${esc(r.stop.name)} aussteigen: an ${fmtTime(r.best.arrive)} – ${gainText}</div>
-      <div class="legs">${legsText(r.best)}</div>
-      <div class="risk">Umstiegszeit ${buffer} min${buffer <= 2 ? ' – knapp!' : ''} · ${missText}</div>
-    </div>`);
-  }
-  if (!any) html.push(`<div class="muted small">An den nächsten ${alt.results.length || ''} Halten gibt es keine schnellere Verbindung.</div>`);
-  html.push(`<div class="muted small" style="margin-top:6px">Stand ${fmtTime(Date.now())}. Prognosen bei Störungen sind oft ungenau.</div>`);
+  const stayLabel = base.parts.filter(isTransit).length > 1 ? 'Wie geplant' : 'Sitzen bleiben';
+  const html = [`<div class="alt stay">
+    <div class="row between"><span class="head">${stayLabel}: an ${fmtTime(base.arrive)}</span></div>
+    <div class="chips">${chips(base)}</div>
+    ${troubleBadge(base)}
+  </div>`];
+  const list = showAll ? alt.options : alt.options.slice(0, ALT_SHOWN);
+  html.push(...list.map((o) => optionHtml(o, base)));
+  if (!alt.options.length) html.push(`<div class="muted small">An den ${alt.checked} kommenden Halten gibt es keine andere sinnvolle Verbindung.</div>`);
+  if (!showAll && alt.options.length > ALT_SHOWN) html.push(`<button id="more-alt" class="more">${alt.options.length - ALT_SHOWN} weitere Optionen</button>`);
+  if (alt.failed.length) html.push(`<div class="muted small">Keine Daten für: ${alt.failed.map(esc).join(', ')}</div>`);
+  html.push(`<div class="muted small" style="margin-top:6px">Geprüft: ${alt.checked} Halte · Stand ${fmtTime(Date.now())}. Prognosen bei Störungen sind oft ungenau.</div>`);
   $('#alternatives').innerHTML = html.join('');
+  $('#more-alt')?.addEventListener('click', () => renderAlternatives(true));
 }
 
 function initMap() {

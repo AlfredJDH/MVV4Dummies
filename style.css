@@ -121,3 +121,12 @@ button:disabled { opacity: .45; }
 .notices > summary { color: var(--warn); font-size: 14px; font-weight: 600; }
 .notice { border-top: 1px solid var(--line); padding: 8px 0 0; margin-top: 8px; font-size: 14px; }
 .notice details { white-space: pre-line; color: var(--muted); }
+
+.alt .chips { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; margin: 6px 0 2px; }
+.alt .chips .line-badge {
+  display: inline-block; min-width: 30px; text-align: center; padding: 1px 6px;
+  border-radius: 6px; color: #fff; font-weight: 700; font-size: 13px;
+}
+.alt .sep { color: var(--muted); margin: 0 3px; }
+.alt .trouble { color: var(--bad); font-size: 14px; margin-top: 4px; font-weight: 600; }
+button.more { width: 100%; margin-top: 8px; }

@@ -1,7 +1,7 @@
 // MVV4Dummies – Fahrtbegleiter für MVV/MVG.
 // Datenquelle: MVG-Fahrplanauskunft (inoffiziell, erlaubt CORS-Abfragen direkt aus dem Browser).
 
-const APP_VERSION = '0.5.6';       // bei jeder Änderung erhöhen, auch 3× in index.html; steht neben dem Titel
+const APP_VERSION = '0.5.7';       // bei jeder Änderung erhöhen, auch 3× in index.html; steht neben dem Titel
 const API = 'https://www.mvg.de/api/bgw-pt/v3';
 const TRANSPORT_TYPES = 'SCHIFF,RUFTAXI,BAHN,UBAHN,TRAM,SBAHN,BUS,REGIONAL_BUS';
 const REFRESH_MS = 30_000;
@@ -14,6 +14,7 @@ const MAX_GPS_DISTANCE_M = 1500;    // weiter weg = nicht auf dieser Strecke
 const AT_STOP_M = 250;              // so nah = "ich bin am Halt"
 const MIN_TRANSFER_MIN = 2;         // kürzere Umstiege (Gleis zu Gleis) sind unrealistisch
 const MAX_SLOWER_MIN = 30;          // deutlich langsamere Optionen gar nicht zeigen
+const TYPE_ICONS = { SBAHN: '🚆', BAHN: '🚆', UBAHN: '🚇', TRAM: '🚊', BUS: '🚍', REGIONAL_BUS: '🚍', SCHIFF: '⛴️', RUFTAXI: '🚕' };
 const TYPE_COLORS = { SBAHN: '#408335', UBAHN: '#0065ae', TRAM: '#d82020', BUS: '#00586a', REGIONAL_BUS: '#00586a', BAHN: '#555', SCHIFF: '#0a7ea4', RUFTAXI: '#777' };
 const DEFAULT_FAVORITES = [{
   from: { id: 'de:09184:2260', name: 'Aying' },
@@ -722,7 +723,7 @@ function selectOption(idx, showAll) {
 
 function initMap() {
   if (state.map || !window.L) return;
-  state.map = L.map('map', { zoomControl: false, attributionControl: true });
+  state.map = L.map('map', { zoomControl: false, attributionControl: true, zoomSnap: 0.25 });
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 18, attribution: '© OpenStreetMap',
   }).addTo(state.map);
@@ -756,26 +757,76 @@ function drawLeg(pts, color, label, opts = {}) {
   }
 }
 
-function pin(stop, text, color, priority = 2) {
+// text ist HTML (bereits escaped); ohne text nur ein Punkt
+// compact: Kurzform, falls die volle Blase mit anderen kollidiert
+function pin(stop, text, color, priority = 2, extraClass = '', compact = null) {
   const m = L.circleMarker([stop.latitude, stop.longitude], { radius: 8, color: '#fff', weight: 3, fillColor: color, fillOpacity: 1 })
-    .bindTooltip(text, { permanent: true, direction: 'auto', offset: [8, 0], className: 'stop-label' })
     .addTo(state.layers);
-  state.labels.push({ layer: m, priority });
+  if (!text) return;
+  m.bindTooltip(text, { permanent: true, direction: 'auto', offset: [8, 0], className: `stop-label ${extraClass}` });
+  state.labels.push({ layer: m, priority, full: text, compact });
+}
+
+// Eine Blase pro Umstieg:  🚍 54 · alle 10 min
+//                          ↓ 14:18  🚶 3 min  ↑ 14:38 · ⏳ 20 min
+function transferBubble(st) {
+  const takt = taktText(st.stop, st.line);
+  const icon = TYPE_ICONS[st.line.transportType] ?? '';
+  const walk = st.walk > 0 ? ` 🚶 ${durText(st.walk)}` : '';
+  return `<div class="bubble-line">${icon} ${badge(st.line)}${takt ? ` · ${takt}` : ''}</div>
+    <div>↓ ${fmtTime(st.arr)}${walk} ↑ ${fmtTime(st.dep)} · ⏳ ${durText(st.wait)}${isTight(st) ? ' <b>knapp!</b>' : ''}</div>`;
 }
 
 // Leaflet kennt keine Kollisionserkennung: überlappende Etiketten nach Wichtigkeit ausblenden.
 // Beim Hineinzoomen tauchen sie wieder auf.
+// Leaflet kennt keine Kollisionserkennung. Deshalb in zwei Durchgängen:
+// 1. jede Blase in Kurzform irgendwo unterbringen (vier Seiten probieren), damit möglichst alle sichtbar sind;
+// 2. nach Wichtigkeit auf die volle Blase vergrößern, wo Platz ist.
+// Punkte gelten als Hindernis, damit keine Blase einen Umstieg verdeckt. Beim Zoomen neu verteilt.
+const PLACEMENTS = [['right', [8, 0]], ['left', [-8, 0]], ['top', [0, -8]], ['bottom', [0, 8]]];
+
 function declutterLabels() {
-  const shown = [];
-  const items = [...state.labels].sort((a, b) => b.priority - a.priority);
-  for (const { layer } of items) {
-    const el = layer.getTooltip()?.getElement();
-    if (!el) continue;
-    el.style.visibility = '';
-    const r = el.getBoundingClientRect();
-    const hit = shown.some((o) => r.left < o.right && r.right > o.left && r.top < o.bottom && r.bottom > o.top);
-    if (hit) el.style.visibility = 'hidden'; else shown.push(r);
+  if (!state.map) return;
+  const box = state.map.getContainer().getBoundingClientRect();
+  const inside = (r) => r.left >= box.left && r.right <= box.right && r.top >= box.top && r.bottom <= box.bottom;
+  const dots = state.labels.map(({ layer }) => {
+    const p = state.map.latLngToContainerPoint(layer.getLatLng());
+    return { left: box.left + p.x - 9, right: box.left + p.x + 9, top: box.top + p.y - 9, bottom: box.top + p.y + 9, owner: layer };
+  });
+  const placedRects = new Map();   // layer -> Rechteck der Blase
+  const collides = (r, owner) => [...dots, ...[...placedRects].map(([l, rect]) => ({ ...rect, owner: l }))]
+    .some((o) => o.owner !== owner && r.left < o.right && r.right > o.left && r.top < o.bottom && r.bottom > o.top);
+
+  const tryPlace = (item, content) => {
+    const tip = item.layer.getTooltip();
+    const el = tip.getElement();
+    if (tip.getContent() !== content) item.layer.setTooltipContent(content);
+    for (const [direction, offset] of PLACEMENTS) {
+      tip.options.direction = direction;
+      tip.options.offset = L.point(offset);
+      tip.update();
+      const r = el.getBoundingClientRect().toJSON();
+      if (inside(r) && !collides(r, item.layer)) { placedRects.set(item.layer, r); return true; }
+    }
+    return false;
+  };
+
+  const items = [...state.labels].filter((i) => i.layer.getTooltip()?.getElement()).sort((a, b) => b.priority - a.priority);
+  const visible = new Set();
+  for (const item of items) {
+    item.layer.getTooltip().getElement().style.visibility = '';
+    if (tryPlace(item, item.compact ?? item.full)) visible.add(item);
   }
+  for (const item of items) {
+    if (!visible.has(item) || !item.compact) continue;
+    const before = placedRects.get(item.layer);
+    placedRects.delete(item.layer);
+    if (!tryPlace(item, item.full)) {   // passt nicht: zurück zur Kurzform an alter Stelle
+      tryPlace(item, item.compact);
+      if (!placedRects.has(item.layer)) placedRects.set(item.layer, before);
+    }
+  }
+  for (const item of items) if (!visible.has(item)) item.layer.getTooltip().getElement().style.visibility = 'hidden';
 }
 
 function renderMap(conn, pos, stops) {
@@ -783,6 +834,12 @@ function renderMap(conn, pos, stops) {
   state.layers.clearLayers();
   state.labels = [];
   const opt = state.selected;
+  // Mit gewählter Option größere Karte; Größe vor dem Zoomen anpassen
+  const mapEl = $('#map');
+  if (mapEl.classList.contains('tall') !== Boolean(opt)) {
+    mapEl.classList.toggle('tall', Boolean(opt));
+    state.map.invalidateSize();
+  }
   const bounds = [];
   conn.parts.forEach((p, i) => {
     const pts = partPoints(p);
@@ -810,28 +867,23 @@ function renderMap(conn, pos, stops) {
     const from = Math.max(0, pos.seg), fromIdx = nearestIndex(basePts, stops[from]);
     const exitIdx = nearestIndex(basePts, opt.exit);
     const ridePts = basePts.slice(Math.min(fromIdx, exitIdx), Math.max(fromIdx, exitIdx) + 1);
-    drawLeg(ridePts, partColor(part), part.line.label);
+    drawLeg(ridePts, partColor(part));
     // Zoomen auf den neuen Teil ab dem Ausstieg, damit die Etiketten lesbar bleiben
     optBounds.push([opt.exit.latitude, opt.exit.longitude]);
     // Die Abschnitte der Option
     for (const p of opt.conn.parts) {
       const pts = partPoints(p);
-      const takt = isTransit(p) ? taktText(p.from, p.line) : '';
-      const label = isTransit(p) ? `${p.line.label}${takt ? ` · ${takt}` : ''}` : `🚶 ${durText(arrTime(p.to) - depTime(p.from))}`;
-      drawLeg(pts, partColor(p), label, isTransit(p) ? {} : { dashArray: '4 8', weight: 4 });
+      drawLeg(pts, partColor(p), null, isTransit(p) ? {} : { dashArray: '4 8', weight: 4 });
       optBounds.push(...pts);
     }
     const steps = transferSteps(opt);
     const pinColor = (st) => (isTight(st) ? '#b3261e' : '#e8710a');
     steps.forEach((st) => {
       const priority = isTight(st) ? 2.5 : 2;   // knappe Umstiege zuletzt ausblenden
-      const wait = `⏳ ${durText(st.wait)}`;
-      if (st.stop.stationGlobalId === st.arrStop.stationGlobalId) {
-        pin(st.stop, `↓ ${fmtTime(st.arr)} ↑ ${fmtTime(st.dep)} · ${wait}`, pinColor(st), priority);
-      } else {   // Umstieg mit Fußweg zu einem anderen Halt: zwei Punkte
-        pin(st.arrStop, `↓ ${fmtTime(st.arr)}`, pinColor(st), priority);
-        pin(st.stop, `↑ ${fmtTime(st.dep)} · ${wait}`, pinColor(st), priority);
-      }
+      // Bei Fußweg zu einem anderen Halt: Ankunftshalt nur als Punkt, die Blase am Einstieg
+      if (st.stop.stationGlobalId !== st.arrStop.stationGlobalId) pin(st.arrStop, null, pinColor(st));
+      const compact = `${TYPE_ICONS[st.line.transportType] ?? ''} ${badge(st.line)} ↑ ${fmtTime(st.dep)}${isTight(st) ? ' <b>knapp!</b>' : ''}`;
+      pin(st.stop, transferBubble(st), pinColor(st), priority, `bubble${isTight(st) ? ' tight-bubble' : ''}`, compact);
     });
     pin(opt.conn.parts.at(-1).to, `🎯 ${fmtTime(opt.conn.arrive)}`, '#1e7d3a', 3);
     if (state.fitSelection && optBounds.length) state.map.fitBounds(optBounds, { padding: [40, 40] });

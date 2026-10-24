@@ -152,3 +152,13 @@ button.more { width: 100%; margin-top: 8px; }
 
 .alt .transfers { display: flex; flex-direction: column; font-size: 14px; margin-top: 4px; }
 .tight { color: var(--bad); font-weight: 600; }
+
+.leaflet-tooltip.bubble { font-size: 13px; font-weight: 600; line-height: 1.35; padding: 4px 8px; }
+.leaflet-tooltip.bubble .bubble-line { display: flex; align-items: center; gap: 4px; }
+.leaflet-tooltip.bubble .line-badge {
+  display: inline-block; min-width: 26px; text-align: center; padding: 0 5px;
+  border-radius: 5px; color: #fff; font-weight: 700; font-size: 12px;
+}
+.leaflet-tooltip.tight-bubble { border: 2px solid #b3261e; }
+.leaflet-tooltip.tight-bubble b { color: #b3261e; }
+.map.tall { height: 58vh; }

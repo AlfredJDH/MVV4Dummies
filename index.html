@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="de">
+<html lang="de" data-version="0.5.1">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -13,9 +13,20 @@
   <link rel="icon" href="icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
   <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=0.5.1">
 </head>
 <body>
+  <div id="error-banner" class="error-banner" hidden></div>
+  <script>
+    // Fehler sichtbar machen, damit man sie per Screenshot melden kann.
+    function showError(msg) {
+      var el = document.getElementById('error-banner');
+      el.hidden = false;
+      el.textContent = 'Fehler: ' + msg + ' (v' + (document.documentElement.dataset.version || '?') + ') – App schließen und neu öffnen. Bleibt es, bitte Screenshot schicken.';
+    }
+    window.addEventListener('error', function (e) { showError(e.message); });
+    window.addEventListener('unhandledrejection', function (e) { showError(e.reason && e.reason.message || String(e.reason)); });
+  </script>
   <header class="topbar">
     <button id="back" class="icon-btn" hidden aria-label="Zurück">‹</button>
     <h1>MVV4Dummies <span id="version" class="version"></span></h1>
@@ -76,6 +87,6 @@
   </main>
 
   <script src="vendor/leaflet/leaflet.js"></script>
-  <script type="module" src="app.js"></script>
+  <script type="module" src="app.js?v=0.5.1"></script>
 </body>
 </html>

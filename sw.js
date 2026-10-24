@@ -1,10 +1,16 @@
 // Hält nur die App-Hülle offline vor; Fahrplandaten kommen immer live.
-const CACHE = 'mvv4dummies-v2';
+const CACHE = 'mvv4dummies-v3';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest', 'icon.svg', 'apple-touch-icon.png', 'vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css'];
 
-self.addEventListener('install', (e) => e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL))));
+// Neue Version sofort übernehmen, nicht erst wenn die App ganz geschlossen war.
+self.addEventListener('install', (e) => {
+  self.skipWaiting();
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)));
+});
 self.addEventListener('activate', (e) => e.waitUntil(
-  caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)))),
+  caches.keys()
+    .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+    .then(() => self.clients.claim()),
 ));
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
@@ -15,5 +21,5 @@ self.addEventListener('fetch', (e) => {
     const copy = res.clone();
     caches.open(CACHE).then((c) => c.put(e.request, copy));
     return res;
-  }).catch(() => caches.match(e.request)));
+  }).catch(() => caches.match(e.request, { ignoreSearch: true })));
 });

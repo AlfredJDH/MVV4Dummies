@@ -1,7 +1,7 @@
 // MVV4Dummies – Fahrtbegleiter für MVV/MVG.
 // Datenquelle: MVG-Fahrplanauskunft (inoffiziell, erlaubt CORS-Abfragen direkt aus dem Browser).
 
-const APP_VERSION = '0.5.0';       // bei jeder Änderung erhöhen; steht oben neben dem Titel
+const APP_VERSION = '0.5.1';       // bei jeder Änderung erhöhen, auch 3× in index.html; steht neben dem Titel
 const API = 'https://www.mvg.de/api/bgw-pt/v3';
 const TRANSPORT_TYPES = 'SCHIFF,RUFTAXI,BAHN,UBAHN,TRAM,SBAHN,BUS,REGIONAL_BUS';
 const REFRESH_MS = 30_000;
@@ -733,7 +733,8 @@ function renderMap(conn, pos, stops) {
     state.map.fitBounds(bounds, { padding: [20, 20] });
     state.mapFitted = true;
   }
-  $('#map-caption').innerHTML = caption;
+  const captionEl = $('#map-caption');
+  if (captionEl) captionEl.innerHTML = caption;
   $('#clear-option')?.addEventListener('click', (e) => { e.preventDefault(); selectOption(-1); });
 }
 
@@ -766,6 +767,7 @@ $('#check-alt').onclick = runAlternatives;
 $('#other-train').onclick = cycleTrain;
 document.addEventListener('visibilitychange', () => { if (!document.hidden && state.trip) refresh(); });
 renderFavorites();
-$('#version').textContent = `v${APP_VERSION}`;
+const versionEl = $('#version');
+if (versionEl) versionEl.textContent = `v${APP_VERSION}`;
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});

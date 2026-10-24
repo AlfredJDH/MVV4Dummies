@@ -1,7 +1,7 @@
 // MVV4Dummies – Fahrtbegleiter für MVV/MVG.
 // Datenquelle: MVG-Fahrplanauskunft (inoffiziell, erlaubt CORS-Abfragen direkt aus dem Browser).
 
-const APP_VERSION = '0.5.5';       // bei jeder Änderung erhöhen, auch 3× in index.html; steht neben dem Titel
+const APP_VERSION = '0.5.6';       // bei jeder Änderung erhöhen, auch 3× in index.html; steht neben dem Titel
 const API = 'https://www.mvg.de/api/bgw-pt/v3';
 const TRANSPORT_TYPES = 'SCHIFF,RUFTAXI,BAHN,UBAHN,TRAM,SBAHN,BUS,REGIONAL_BUS';
 const REFRESH_MS = 30_000;
@@ -272,7 +272,7 @@ async function computeAlternatives(conn, pos, onProgress = () => {}) {
         // Verpasst man den ersten Anschluss, nimmt man die beste Verbindung, die später losfährt.
         const later = others.filter((x) => x.firstTransitDepart > o.firstTransitDepart);
         const fallback = later.length ? later.reduce((a, b) => (b.arrive < a.arrive ? b : a)) : null;
-        return { exit: stop, reach, conn: o, fallback, buffer: o.firstTransitDepart - reach };
+        return { exit: stop, fromLine: part.line, reach, conn: o, fallback, buffer: o.firstTransitDepart - reach };
       }),
     };
   };
@@ -317,19 +317,27 @@ async function computeAlternatives(conn, pos, onProgress = () => {}) {
 
 const transfers = (conn) => Math.max(0, conn.parts.filter(isTransit).length - 1);
 
-// Alle Umstiege einer Option, beginnend mit dem Ausstieg aus meinem Zug:
-// wo ich einsteige, wann, wie lange ich laufe und wie lange ich danach noch warte.
+// Alle Umstiege einer Option, beginnend mit dem Umstieg aus meinem Zug:
+// ↓ wann/wo ich ankomme, ↑ wann/wo ich weiterfahre, Fußweg und Wartezeit dazwischen.
 function transferSteps(opt) {
   const steps = [];
-  let prevArr = opt.reach, walk = 0;
+  let arr = opt.reach, arrStop = opt.exit, arrLine = opt.fromLine, walk = 0;
   for (const p of opt.conn.parts) {
     if (!isTransit(p)) { walk += arrTime(p.to) - depTime(p.from); continue; }
     const dep = depTime(p.from);
-    steps.push({ stop: p.from, line: p.line, dep, walk, wait: Math.max(0, dep - prevArr - walk) });
-    prevArr = arrTime(p.to);
+    steps.push({ arrStop, arrLine, arr, stop: p.from, line: p.line, dep, walk, wait: Math.max(0, dep - arr - walk) });
+    arr = arrTime(p.to); arrStop = p.to; arrLine = p.line;
     walk = 0;
   }
   return steps;
+}
+
+// "Giesing: S5 ↓ 13:59 · U2 ↑ 14:09 (alle 10 min) · ⏳ 10 min"
+function transferHtml(st) {
+  const takt = taktText(st.stop, st.line);
+  const otherStop = st.stop.stationGlobalId !== st.arrStop.stationGlobalId ? ` ${esc(st.stop.name)}` : '';
+  return `<span class="${isTight(st) ? 'tight' : ''}"><b>${esc(st.arrStop.name)}:</b> ${esc(st.arrLine?.label ?? '')} ↓ ${fmtTime(st.arr)}
+    · ${esc(st.line.label)} ↑ ${fmtTime(st.dep)}${otherStop}${takt ? ` (${takt})` : ''} · ${stepText(st)}</span>`;
 }
 
 const isTight = (step) => minutes(step.wait + step.walk) <= MIN_TRANSFER_MIN + 1;
@@ -654,10 +662,6 @@ function chips(conn) {
   return conn.parts.map((p) => (isTransit(p) ? badge(p.line) : '<span class="walk">🚶</span>')).join('<span class="sep">›</span>');
 }
 
-function legsText(conn) {
-  return conn.parts.filter(isTransit).map((p) => `${esc(p.line.label)} 🚀 ${fmtTime(depTime(p.from))} ${esc(p.from.name)}`).join(' · ');
-}
-
 function troubleBadge(conn) {
   const { incidents } = relevantMessages(state.messages, conn, Date.now());
   if (conn.cancelled) return '<div class="trouble">Fällt aus</div>';
@@ -675,9 +679,8 @@ function optionHtml(o, base) {
   return `<div class="alt ${gain > 0 ? 'better' : ''} ${state.selected === o ? 'selected' : ''}" data-idx="${idx}" role="button">
     <div class="row between"><span class="head">🚀 ${fmtTime(o.conn.firstTransitDepart)} → 🎯 ${fmtTime(o.conn.arrive)} · noch ${durText(o.conn.arrive - Date.now())}</span><span class="${gain > 0 ? 'ontime' : 'muted'}">${gainText}</span></div>
     <div class="chips">${badge(state.alternatives.line)}<span class="sep">›</span>${chips(o.conn)}</div>
-    <div class="legs">Aussteigen in <b>${esc(o.exit.name)}</b> (${fmtTime(o.reach)}) · ${legsText(o.conn)} · ${n} Umstieg${n > 1 ? 'e' : ''}</div>
-    <div class="transfers">${transferSteps(o).map((st) =>
-      `<span class="${isTight(st) ? 'tight' : ''}">${esc(st.stop.name)} → ${esc(st.line.label)}${taktText(st.stop, st.line) ? ` (${taktText(st.stop, st.line)})` : ''}: ${stepText(st)}</span>`).join('')}</div>
+    <div class="legs">${n} Umstieg${n > 1 ? 'e' : ''}</div>
+    <div class="transfers">${transferSteps(o).map(transferHtml).join('')}</div>
     <div class="risk">Ersten Anschluss ${missText}</div>
     ${troubleBadge(o.conn)}
   </div>`;
@@ -820,29 +823,31 @@ function renderMap(conn, pos, stops) {
     }
     const steps = transferSteps(opt);
     const pinColor = (st) => (isTight(st) ? '#b3261e' : '#e8710a');
-    steps.forEach((st, i) => {
-      // Einstieg am selben Halt wie der Ausstieg: ein Punkt mit Wartezeit statt zwei übereinander
+    steps.forEach((st) => {
       const priority = isTight(st) ? 2.5 : 2;   // knappe Umstiege zuletzt ausblenden
-      if (i === 0 && st.walk === 0) pin(opt.exit, `Aussteigen ${fmtTime(opt.reach)} · ⏳ ${durText(st.wait)}`, pinColor(st), priority);
-      else pin(st.stop, `Umsteigen 🚀 ${fmtTime(st.dep)} · ⏳ ${durText(st.wait)}`, pinColor(st), priority);
+      const wait = `⏳ ${durText(st.wait)}`;
+      if (st.stop.stationGlobalId === st.arrStop.stationGlobalId) {
+        pin(st.stop, `↓ ${fmtTime(st.arr)} ↑ ${fmtTime(st.dep)} · ${wait}`, pinColor(st), priority);
+      } else {   // Umstieg mit Fußweg zu einem anderen Halt: zwei Punkte
+        pin(st.arrStop, `↓ ${fmtTime(st.arr)}`, pinColor(st), priority);
+        pin(st.stop, `↑ ${fmtTime(st.dep)} · ${wait}`, pinColor(st), priority);
+      }
     });
-    if (!steps.length || steps[0].walk > 0) pin(opt.exit, `Aussteigen ${fmtTime(opt.reach)}`, '#e8710a');
     pin(opt.conn.parts.at(-1).to, `🎯 ${fmtTime(opt.conn.arrive)}`, '#1e7d3a', 3);
     if (state.fitSelection && optBounds.length) state.map.fitBounds(optBounds, { padding: [40, 40] });
-    // Ablauf mit jeder Wartezeit: "⏳ 10 min › U2 2 min › ⏳ 4 min › X30 9 min › 🚶 2 min › ⏳ 1 min › U3 7 min"
+    // Ablauf: "S5 ↓ 13:59 Giesing › ⏳ 10 min › U2 ↑ 14:09 (alle 10 min) › ↓ 14:11 Silberhornstraße › … › 🎯 14:35"
     const flow = [];
-    let si = 0;
-    for (const p of opt.conn.parts) {
-      if (!isTransit(p)) { flow.push(`🚶 ${durText(arrTime(p.to) - depTime(p.from))}`); continue; }
-      const st = steps[si++];
-      const takt = taktText(p.from, p.line);
+    steps.forEach((st, i) => {
+      const takt = taktText(st.stop, st.line);
+      flow.push(`${i === 0 ? `${esc(st.arrLine.label)} ` : ''}↓ ${fmtTime(st.arr)} ${esc(st.arrStop.name)}`);
+      if (st.walk > 0) flow.push(`🚶 ${durText(st.walk)}`);
       flow.push(`<span class="${isTight(st) ? 'tight' : ''}">⏳ ${durText(st.wait)}</span>`,
-        `${esc(p.line.label)} 🚀 ${fmtTime(depTime(p.from))}${takt ? ` (${takt})` : ''}`);
-    }
+        `${esc(st.line.label)} ↑ ${fmtTime(st.dep)}${takt ? ` (${takt})` : ''}`);
+    });
     flow.push(`🎯 ${fmtTime(opt.conn.arrive)}`);
     const legsSummary = flow.join(' › ');
     caption = `<b>Option:</b> 🎯 ${fmtTime(opt.conn.arrive)} · noch ${durText(opt.conn.arrive - Date.now())}<br>
-      ${esc(part.line.label)} bis ${esc(opt.exit.name)} 🎯 ${fmtTime(opt.reach)} › ${legsSummary}
+      ${legsSummary}
       · <a href="#" id="clear-option">Zurück zum Plan</a>`;
   } else if (state.fitSelection && bounds.length) {
     state.map.fitBounds(bounds, { padding: [20, 20] });

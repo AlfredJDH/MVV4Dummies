@@ -25,6 +25,7 @@ const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtTime = (ms) => new Date(ms).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
 const minutes = (ms) => Math.round(ms / 60_000);
+const durText = (ms) => { const m = Math.max(0, minutes(ms)); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`; };
 
 function store(key, fallback) {
   try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
@@ -327,6 +328,7 @@ const state = {
   messages: [],
   messagesAt: 0,
   alternatives: null,
+  selected: null,    // in der Karte gezeigte Option
   altKey: null,
   timer: null,
   watchId: null,
@@ -395,6 +397,7 @@ function startTrip(trip) {
   state.conn = null;
   state.manualKey = null;
   state.alternatives = null;
+  state.selected = null;
   state.altKey = null;
   $('#home').hidden = true;
   $('#trip').hidden = false;
@@ -486,6 +489,7 @@ async function runAlternatives() {
   const pos = locate(conn, state.gps, Date.now());
   state.altKey = `${conn.key}|${pos.partIdx}|${pos.seg}`;
   $('#alternatives').innerHTML = '<span class="muted">Rechne …</span>';
+  state.selected = null;
   state.alternatives = await computeAlternatives(conn, pos, (done, total) => {
     $('#alternatives').innerHTML = `<span class="muted">Prüfe Halte … ${done}/${total}</span>`;
   });
@@ -583,8 +587,9 @@ function optionHtml(o, base) {
     ? `verpasst: an ${fmtTime(o.fallback.arrive)} (+${minutes(o.fallback.arrive - o.conn.arrive)} min)`
     : 'verpasst: keine spätere Verbindung';
   const n = transfers(o.conn) + 1;   // +1: aus dem jetzigen Zug aussteigen
-  return `<div class="alt ${gain > 0 ? 'better' : ''}">
-    <div class="row between"><span class="head">an ${fmtTime(o.conn.arrive)}</span><span class="${gain > 0 ? 'ontime' : 'muted'}">${gainText}</span></div>
+  const idx = state.alternatives.options.indexOf(o);
+  return `<div class="alt ${gain > 0 ? 'better' : ''} ${state.selected === o ? 'selected' : ''}" data-idx="${idx}" role="button">
+    <div class="row between"><span class="head">an ${fmtTime(o.conn.arrive)} · ${durText(o.conn.arrive - Date.now())}</span><span class="${gain > 0 ? 'ontime' : 'muted'}">${gainText}</span></div>
     <div class="chips">${badge(state.alternatives.line)}<span class="sep">›</span>${chips(o.conn)}</div>
     <div class="legs">Aussteigen in <b>${esc(o.exit.name)}</b> (${fmtTime(o.reach)}) · ${legsText(o.conn)} · ${n} Umstieg${n > 1 ? 'e' : ''}</div>
     <div class="risk">Umstiegszeit ${buffer} min${buffer <= MIN_TRANSFER_MIN + 1 ? ' – knapp!' : ''} · ${missText}</div>
@@ -597,8 +602,8 @@ function renderAlternatives(showAll = false) {
   if (!alt) return;
   const base = alt.base;
   const stayLabel = base.parts.filter(isTransit).length > 1 ? 'Wie geplant' : 'Sitzen bleiben';
-  const html = [`<div class="alt stay">
-    <div class="row between"><span class="head">${stayLabel}: an ${fmtTime(base.arrive)}</span></div>
+  const html = [`<div class="alt stay ${state.selected ? '' : 'selected'}" data-idx="-1" role="button">
+    <div class="row between"><span class="head">${stayLabel}: an ${fmtTime(base.arrive)} · ${durText(base.arrive - Date.now())}</span></div>
     <div class="chips">${chips(base)}</div>
     ${troubleBadge(base)}
   </div>`];
@@ -608,8 +613,21 @@ function renderAlternatives(showAll = false) {
   if (!showAll && alt.options.length > ALT_SHOWN) html.push(`<button id="more-alt" class="more">${alt.options.length - ALT_SHOWN} weitere Optionen</button>`);
   if (alt.failed.length) html.push(`<div class="muted small">Keine Daten für: ${alt.failed.map(esc).join(', ')}</div>`);
   html.push(`<div class="muted small" style="margin-top:6px">Geprüft: ${alt.checked} Halte · Stand ${fmtTime(Date.now())}. Prognosen bei Störungen sind oft ungenau.</div>`);
+  if (alt.options.length) html.push('<div class="muted small">Tippe auf eine Option, um sie in der Karte zu sehen.</div>');
   $('#alternatives').innerHTML = html.join('');
   $('#more-alt')?.addEventListener('click', () => renderAlternatives(true));
+  for (const card of document.querySelectorAll('#alternatives .alt[data-idx]')) {
+    card.addEventListener('click', () => selectOption(Number(card.dataset.idx), showAll));
+  }
+}
+
+function selectOption(idx, showAll) {
+  const opt = idx >= 0 ? state.alternatives.options[idx] : null;
+  state.selected = state.selected === opt ? null : opt;
+  state.fitSelection = true;
+  renderAlternatives(showAll);
+  render();
+  $('#map').scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 function initMap() {
@@ -622,23 +640,91 @@ function initMap() {
   state.map.setView([48.137, 11.575], 11);
 }
 
+const partPoints = (p) => (p.pathPolyline ? decodePolyline(p.pathPolyline) : legStops(p).map((s) => [s.latitude, s.longitude]));
+const partColor = (p) => (isTransit(p) ? TYPE_COLORS[p.line.transportType] ?? '#555' : '#888');
+
+function nearestIndex(pts, stop) {
+  let best = 0, bestD = Infinity;
+  pts.forEach(([lat, lon], i) => {
+    const d = (lat - stop.latitude) ** 2 + (lon - stop.longitude) ** 2;
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  return best;
+}
+
+// Linie mit dauerhaftem Etikett "U2 · 7 min" in der Mitte
+function drawLeg(pts, color, label, opts = {}) {
+  if (pts.length < 2) return;
+  L.polyline(pts, { color, weight: 6, opacity: 0.95, ...opts }).addTo(state.layers);
+  if (label) {
+    L.marker(pts[Math.floor(pts.length / 2)], { opacity: 0, interactive: false })
+      .bindTooltip(label, { permanent: true, direction: 'center', className: 'leg-label' })
+      .addTo(state.layers);
+  }
+}
+
+function pin(stop, text, color) {
+  L.circleMarker([stop.latitude, stop.longitude], { radius: 8, color: '#fff', weight: 3, fillColor: color, fillOpacity: 1 })
+    .bindTooltip(text, { permanent: true, direction: 'auto', offset: [8, 0], className: 'stop-label' })
+    .addTo(state.layers);
+}
+
 function renderMap(conn, pos, stops) {
   if (!state.map) return;
   state.layers.clearLayers();
+  const opt = state.selected;
   const bounds = [];
   conn.parts.forEach((p, i) => {
-    const pts = p.pathPolyline ? decodePolyline(p.pathPolyline) : legStops(p).map((s) => [s.latitude, s.longitude]);
+    const pts = partPoints(p);
     if (!pts.length) return;
-    const color = isTransit(p) ? TYPE_COLORS[p.line.transportType] ?? '#555' : '#888';
-    L.polyline(pts, { color, weight: i === pos.partIdx ? 6 : 4, opacity: i === pos.partIdx ? 0.9 : 0.5, dashArray: isTransit(p) ? null : '4 6' }).addTo(state.layers);
+    const current = i === pos.partIdx;
+    L.polyline(pts, {
+      color: partColor(p), weight: current ? 6 : 4,
+      opacity: opt ? 0.25 : current ? 0.9 : 0.5, dashArray: isTransit(p) ? null : '4 6',
+    }).addTo(state.layers);
     bounds.push(...pts);
   });
   stops.forEach((s, i) => {
     L.circleMarker([s.latitude, s.longitude], {
-      radius: i === pos.seg + 1 ? 7 : 4, color: '#fff', weight: 2,
-      fillColor: i <= pos.seg ? '#999' : TYPE_COLORS[conn.parts[pos.partIdx].line.transportType] ?? '#555', fillOpacity: 1,
+      radius: i === pos.seg + 1 ? 7 : 4, color: '#fff', weight: 2, opacity: opt ? 0.4 : 1, fillOpacity: opt ? 0.4 : 1,
+      fillColor: i <= pos.seg ? '#999' : TYPE_COLORS[conn.parts[pos.partIdx].line.transportType] ?? '#555',
     }).bindTooltip(s.name).addTo(state.layers);
   });
+
+  let caption = '';
+  if (opt) {
+    const optBounds = [];
+    // Mein Zug bis zum Ausstieg
+    const part = conn.parts[pos.partIdx];
+    const basePts = partPoints(part);
+    const from = Math.max(0, pos.seg), fromIdx = nearestIndex(basePts, stops[from]);
+    const exitIdx = nearestIndex(basePts, opt.exit);
+    const ridePts = basePts.slice(Math.min(fromIdx, exitIdx), Math.max(fromIdx, exitIdx) + 1);
+    const rideStart = pos.seg < 0 ? depTime(stops[0]) : Date.now();
+    const rideText = `${part.line.label} · ${durText(opt.reach - rideStart)}`;
+    drawLeg(ridePts, partColor(part), rideText);
+    // Zoomen auf den neuen Teil ab dem Ausstieg, damit die Etiketten lesbar bleiben
+    optBounds.push([opt.exit.latitude, opt.exit.longitude]);
+    // Die Abschnitte der Option
+    for (const p of opt.conn.parts) {
+      const pts = partPoints(p);
+      const dur = durText(arrTime(p.to) - depTime(p.from));
+      drawLeg(pts, partColor(p), isTransit(p) ? `${p.line.label} · ${dur}` : `🚶 ${dur}`, isTransit(p) ? {} : { dashArray: '4 8', weight: 4 });
+      optBounds.push(...pts);
+    }
+    pin(opt.exit, `Aussteigen ${fmtTime(opt.reach)}`, '#e8710a');
+    opt.conn.parts.filter(isTransit).slice(1).forEach((p) => pin(p.from, `Umsteigen ${fmtTime(depTime(p.from))}`, '#e8710a'));
+    pin(opt.conn.parts.at(-1).to, `Ziel ${fmtTime(opt.conn.arrive)}`, '#1e7d3a');
+    if (state.fitSelection && optBounds.length) state.map.fitBounds(optBounds, { padding: [40, 40] });
+    const legsSummary = opt.conn.parts.map((p) => `${isTransit(p) ? esc(p.line.label) : '🚶'} ${durText(arrTime(p.to) - depTime(p.from))}`).join(' › ');
+    caption = `<b>Option:</b> an ${fmtTime(opt.conn.arrive)} · ${durText(opt.conn.arrive - Date.now())} ab jetzt<br>
+      ${esc(rideText)} bis ${esc(opt.exit.name)} › ${durText(opt.buffer)} warten › ${legsSummary}
+      · <a href="#" id="clear-option">Zurück zum Plan</a>`;
+  } else if (state.fitSelection && bounds.length) {
+    state.map.fitBounds(bounds, { padding: [20, 20] });
+  }
+  state.fitSelection = false;
+
   if (state.gps) {
     L.circleMarker([state.gps.lat, state.gps.lon], { radius: 8, color: '#fff', weight: 3, fillColor: '#1a73e8', fillOpacity: 1 }).addTo(state.layers);
   }
@@ -646,6 +732,8 @@ function renderMap(conn, pos, stops) {
     state.map.fitBounds(bounds, { padding: [20, 20] });
     state.mapFitted = true;
   }
+  $('#map-caption').innerHTML = caption;
+  $('#clear-option')?.addEventListener('click', (e) => { e.preventDefault(); selectOption(-1); });
 }
 
 function cycleTrain() {
@@ -656,6 +744,7 @@ function cycleTrain() {
   state.conn = running[(i + 1) % running.length];
   state.manualKey = state.conn.key;
   state.alternatives = null;
+  state.selected = null;
   state.altKey = null;
   $('#alternatives').innerHTML = '<span class="muted small">Zug gewechselt – tippe auf „Prüfen“.</span>';
   render();

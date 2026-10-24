@@ -1,7 +1,7 @@
 // MVV4Dummies – Fahrtbegleiter für MVV/MVG.
 // Datenquelle: MVG-Fahrplanauskunft (inoffiziell, erlaubt CORS-Abfragen direkt aus dem Browser).
 
-const APP_VERSION = '0.5.3';       // bei jeder Änderung erhöhen, auch 3× in index.html; steht neben dem Titel
+const APP_VERSION = '0.5.4';       // bei jeder Änderung erhöhen, auch 3× in index.html; steht neben dem Titel
 const API = 'https://www.mvg.de/api/bgw-pt/v3';
 const TRANSPORT_TYPES = 'SCHIFF,RUFTAXI,BAHN,UBAHN,TRAM,SBAHN,BUS,REGIONAL_BUS';
 const REFRESH_MS = 30_000;
@@ -317,6 +317,28 @@ async function computeAlternatives(conn, pos, onProgress = () => {}) {
 
 const transfers = (conn) => Math.max(0, conn.parts.filter(isTransit).length - 1);
 
+// Alle Umstiege einer Option, beginnend mit dem Ausstieg aus meinem Zug:
+// wo ich einsteige, wann, wie lange ich laufe und wie lange ich danach noch warte.
+function transferSteps(opt) {
+  const steps = [];
+  let prevArr = opt.reach, walk = 0;
+  for (const p of opt.conn.parts) {
+    if (!isTransit(p)) { walk += arrTime(p.to) - depTime(p.from); continue; }
+    const dep = depTime(p.from);
+    steps.push({ stop: p.from, line: p.line, dep, walk, wait: Math.max(0, dep - prevArr - walk) });
+    prevArr = arrTime(p.to);
+    walk = 0;
+  }
+  return steps;
+}
+
+const isTight = (step) => minutes(step.wait + step.walk) <= MIN_TRANSFER_MIN + 1;
+
+function stepText(step) {
+  const walk = step.walk > 0 ? `🚶 ${durText(step.walk)} + ` : '';
+  return `${walk}⏳ ${durText(step.wait)}${isTight(step) ? ' – knapp!' : ''}`;
+}
+
 // ---------- Zustand ----------
 
 const state = {
@@ -583,7 +605,6 @@ function troubleBadge(conn) {
 function optionHtml(o, base) {
   const gain = minutes(base.arrive - o.conn.arrive);
   const gainText = gain > 0 ? `${gain} min schneller` : gain < 0 ? `${-gain} min später` : 'gleich schnell';
-  const buffer = minutes(o.buffer);
   const missText = o.fallback
     ? `verpasst: 🎯 ${fmtTime(o.fallback.arrive)} (+${minutes(o.fallback.arrive - o.conn.arrive)} min)`
     : 'verpasst: keine spätere Verbindung';
@@ -593,7 +614,9 @@ function optionHtml(o, base) {
     <div class="row between"><span class="head">🚀 ${fmtTime(o.conn.firstTransitDepart)} → 🎯 ${fmtTime(o.conn.arrive)} · noch ${durText(o.conn.arrive - Date.now())}</span><span class="${gain > 0 ? 'ontime' : 'muted'}">${gainText}</span></div>
     <div class="chips">${badge(state.alternatives.line)}<span class="sep">›</span>${chips(o.conn)}</div>
     <div class="legs">Aussteigen in <b>${esc(o.exit.name)}</b> (${fmtTime(o.reach)}) · ${legsText(o.conn)} · ${n} Umstieg${n > 1 ? 'e' : ''}</div>
-    <div class="risk">Umstiegszeit ${buffer} min${buffer <= MIN_TRANSFER_MIN + 1 ? ' – knapp!' : ''} · ${missText}</div>
+    <div class="transfers">${transferSteps(o).map((st) =>
+      `<span class="${isTight(st) ? 'tight' : ''}">${esc(st.stop.name)} → ${esc(st.line.label)}: ${stepText(st)}</span>`).join('')}</div>
+    <div class="risk">Ersten Anschluss ${missText}</div>
     ${troubleBadge(o.conn)}
   </div>`;
 }
@@ -638,6 +661,8 @@ function initMap() {
     maxZoom: 18, attribution: '© OpenStreetMap',
   }).addTo(state.map);
   state.layers = L.layerGroup().addTo(state.map);
+  state.labels = [];
+  state.map.on('zoomend moveend', declutterLabels);
   state.map.setView([48.137, 11.575], 11);
 }
 
@@ -658,21 +683,39 @@ function drawLeg(pts, color, label, opts = {}) {
   if (pts.length < 2) return;
   L.polyline(pts, { color, weight: 6, opacity: 0.95, ...opts }).addTo(state.layers);
   if (label) {
-    L.marker(pts[Math.floor(pts.length / 2)], { opacity: 0, interactive: false })
+    const m = L.marker(pts[Math.floor(pts.length / 2)], { opacity: 0, interactive: false })
       .bindTooltip(label, { permanent: true, direction: 'center', className: 'leg-label' })
       .addTo(state.layers);
+    state.labels.push({ layer: m, priority: 1 });
   }
 }
 
-function pin(stop, text, color) {
-  L.circleMarker([stop.latitude, stop.longitude], { radius: 8, color: '#fff', weight: 3, fillColor: color, fillOpacity: 1 })
+function pin(stop, text, color, priority = 2) {
+  const m = L.circleMarker([stop.latitude, stop.longitude], { radius: 8, color: '#fff', weight: 3, fillColor: color, fillOpacity: 1 })
     .bindTooltip(text, { permanent: true, direction: 'auto', offset: [8, 0], className: 'stop-label' })
     .addTo(state.layers);
+  state.labels.push({ layer: m, priority });
+}
+
+// Leaflet kennt keine Kollisionserkennung: überlappende Etiketten nach Wichtigkeit ausblenden.
+// Beim Hineinzoomen tauchen sie wieder auf.
+function declutterLabels() {
+  const shown = [];
+  const items = [...state.labels].sort((a, b) => b.priority - a.priority);
+  for (const { layer } of items) {
+    const el = layer.getTooltip()?.getElement();
+    if (!el) continue;
+    el.style.visibility = '';
+    const r = el.getBoundingClientRect();
+    const hit = shown.some((o) => r.left < o.right && r.right > o.left && r.top < o.bottom && r.bottom > o.top);
+    if (hit) el.style.visibility = 'hidden'; else shown.push(r);
+  }
 }
 
 function renderMap(conn, pos, stops) {
   if (!state.map) return;
   state.layers.clearLayers();
+  state.labels = [];
   const opt = state.selected;
   const bounds = [];
   conn.parts.forEach((p, i) => {
@@ -713,18 +756,35 @@ function renderMap(conn, pos, stops) {
       drawLeg(pts, partColor(p), isTransit(p) ? `${p.line.label} · ${dur}` : `🚶 ${dur}`, isTransit(p) ? {} : { dashArray: '4 8', weight: 4 });
       optBounds.push(...pts);
     }
-    pin(opt.exit, `Aussteigen ${fmtTime(opt.reach)}`, '#e8710a');
-    opt.conn.parts.filter(isTransit).slice(1).forEach((p) => pin(p.from, `Umsteigen ${fmtTime(depTime(p.from))}`, '#e8710a'));
-    pin(opt.conn.parts.at(-1).to, `🎯 ${fmtTime(opt.conn.arrive)}`, '#1e7d3a');
+    const steps = transferSteps(opt);
+    const pinColor = (st) => (isTight(st) ? '#b3261e' : '#e8710a');
+    steps.forEach((st, i) => {
+      // Einstieg am selben Halt wie der Ausstieg: ein Punkt mit Wartezeit statt zwei übereinander
+      const priority = isTight(st) ? 2.5 : 2;   // knappe Umstiege zuletzt ausblenden
+      if (i === 0 && st.walk === 0) pin(opt.exit, `Aussteigen ${fmtTime(opt.reach)} · ⏳ ${durText(st.wait)}`, pinColor(st), priority);
+      else pin(st.stop, `Umsteigen 🚀 ${fmtTime(st.dep)} · ⏳ ${durText(st.wait)}`, pinColor(st), priority);
+    });
+    if (!steps.length || steps[0].walk > 0) pin(opt.exit, `Aussteigen ${fmtTime(opt.reach)}`, '#e8710a');
+    pin(opt.conn.parts.at(-1).to, `🎯 ${fmtTime(opt.conn.arrive)}`, '#1e7d3a', 3);
     if (state.fitSelection && optBounds.length) state.map.fitBounds(optBounds, { padding: [40, 40] });
-    const legsSummary = opt.conn.parts.map((p) => `${isTransit(p) ? esc(p.line.label) : '🚶'} ${durText(arrTime(p.to) - depTime(p.from))}`).join(' › ');
+    // Ablauf mit jeder Wartezeit: "⏳ 10 min › U2 2 min › ⏳ 4 min › X30 9 min › 🚶 2 min › ⏳ 1 min › U3 7 min"
+    const flow = [];
+    let si = 0;
+    for (const p of opt.conn.parts) {
+      const dur = durText(arrTime(p.to) - depTime(p.from));
+      if (!isTransit(p)) { flow.push(`🚶 ${dur}`); continue; }
+      const st = steps[si++];
+      flow.push(`<span class="${isTight(st) ? 'tight' : ''}">⏳ ${durText(st.wait)}</span>`, `${esc(p.line.label)} ${dur}`);
+    }
+    const legsSummary = flow.join(' › ');
     caption = `<b>Option:</b> 🎯 ${fmtTime(opt.conn.arrive)} · noch ${durText(opt.conn.arrive - Date.now())}<br>
-      ${esc(rideText)} bis ${esc(opt.exit.name)} › ${durText(opt.buffer)} warten › ${legsSummary}
+      ${esc(rideText)} bis ${esc(opt.exit.name)} › ${legsSummary}
       · <a href="#" id="clear-option">Zurück zum Plan</a>`;
   } else if (state.fitSelection && bounds.length) {
     state.map.fitBounds(bounds, { padding: [20, 20] });
   }
   state.fitSelection = false;
+  requestAnimationFrame(declutterLabels);
 
   if (state.gps) {
     L.circleMarker([state.gps.lat, state.gps.lon], { radius: 8, color: '#fff', weight: 3, fillColor: '#1a73e8', fillOpacity: 1 }).addTo(state.layers);
@@ -767,6 +827,7 @@ $('#check-alt').onclick = runAlternatives;
 $('#other-train').onclick = cycleTrain;
 document.addEventListener('visibilitychange', () => { if (!document.hidden && state.trip) refresh(); });
 renderFavorites();
+if (new URLSearchParams(location.search).has('debug')) window.__state = state;   // Fehlersuche im Browser
 const versionEl = $('#version');
 if (versionEl) versionEl.textContent = `v${APP_VERSION}`;
 

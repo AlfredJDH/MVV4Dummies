@@ -116,3 +116,8 @@ button:disabled { opacity: .45; }
 .alt .head { font-weight: 600; }
 .alt .risk { color: var(--warn); font-size: 14px; margin-top: 4px; }
 .alt .legs { font-size: 14px; color: var(--muted); margin-top: 2px; }
+
+.notices { padding: 10px 14px; }
+.notices > summary { color: var(--warn); font-size: 14px; font-weight: 600; }
+.notice { border-top: 1px solid var(--line); padding: 8px 0 0; margin-top: 8px; font-size: 14px; }
+.notice details { white-space: pre-line; color: var(--muted); }

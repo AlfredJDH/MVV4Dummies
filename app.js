@@ -185,21 +185,52 @@ function plausible(conn, now) {
 
 // ---------- Störungen ----------
 
+const normName = (n) => String(n ?? '').toLowerCase().replace(/^münchen,\s*/, '').trim();
+
+// Abschnitt aus Titeln wie "Sendlinger Tor <> Implerstraße: ..." -> ['sendlinger tor', 'implerstraße']
+function sectionOf(title) {
+  const m = /^(.+?)\s*<>\s*(.+?)(?::|$)/.exec(htmlToText(title));
+  return m ? [normName(m[1]), normName(m[2])] : null;
+}
+
+// Meldungen, die meine Fahrt wirklich betreffen.
+// incidents = akute Störungen (rot), notices = Baustellen/Fahrplanänderungen (meist schon im Fahrplan).
 function relevantMessages(messages, conn, now) {
-  const labels = new Set(conn.parts.filter(isTransit).map((p) => p.line.label));
+  const legs = conn.parts.filter(isTransit);
+  const stopsOfLine = new Map();   // Linie -> Namen meiner Halte auf dieser Linie
+  for (const p of legs) {
+    const names = stopsOfLine.get(p.line.label) ?? new Set();
+    for (const s of legStops(p)) names.add(normName(s.name));
+    stopsOfLine.set(p.line.label, names);
+  }
   const stations = new Set(conn.parts.flatMap((p) => legStops(p).map((s) => s.stationGlobalId)));
-  const active = [], planned = [];
+
+  const affects = (m) => {
+    const myLines = (m.lines ?? []).map((l) => l.label).filter((l) => stopsOfLine.has(l));
+    const hasLines = (m.lines ?? []).length > 0;
+    // Bahnhofsmeldung: nur wenn sie eine meiner Linien oder gar keine Linie nennt (z. B. Aufzug defekt)
+    const atMyStation = (m.stationGlobalIds ?? []).some((id) => stations.has(id));
+    if (atMyStation && (!hasLines || myLines.length)) return true;
+    if (!myLines.length) return false;
+    // Linienmeldung mit Abschnitt: nur wenn meine Strecke den Abschnitt berührt
+    const section = sectionOf(m.title);
+    if (!section) return true;
+    const text = normName(htmlToText(m.description));
+    return myLines.some((l) => [...stopsOfLine.get(l)].some((n) => section.includes(n) || text.includes(n)));
+  };
+
+  const incidents = [], notices = [];
   for (const m of messages) {
-    const hits = (m.lines ?? []).some((l) => labels.has(l.label)) || (m.stationGlobalIds ?? []).some((id) => stations.has(id));
-    if (!hits) continue;
+    if (!affects(m)) continue;
     const ranges = m.incidentDurations?.length ? m.incidentDurations : [{ from: m.validFrom, to: m.validTo }];
     const isActive = ranges.some((r) => (r.from ?? 0) <= now && now <= (r.to ?? Infinity));
     const startsSoon = ranges.some((r) => r.from > now && r.from - now < 24 * 3600_000);
-    if (isActive) active.push(m); else if (startsSoon) planned.push(m);
+    if (m.type === 'INCIDENT' && isActive) incidents.push(m);
+    else if (isActive || startsSoon) notices.push({ ...m, upcoming: !isActive });
   }
-  // Meldungen am Zug/Abschnitt selbst
-  for (const p of conn.parts) for (const m of [...(p.messages ?? []), ...(p.infos ?? [])]) active.push(m);
-  return { active, planned };
+  // Meldungen direkt an meinem Zug/Abschnitt
+  for (const p of conn.parts) for (const m of [...(p.messages ?? []), ...(p.infos ?? [])]) incidents.push(m);
+  return { incidents, notices };
 }
 
 const htmlToText = (html) => {
@@ -397,9 +428,9 @@ function maybeAutoAlternatives() {
   if (!conn) return;
   const pos = locate(conn, state.gps, Date.now());
   if (pos.seg < 0 || pos.arrived) return;
-  const { active } = relevantMessages(state.messages, conn, Date.now());
+  const { incidents } = relevantMessages(state.messages, conn, Date.now());
   const delayed = minutes(conn.arrive - Date.parse(conn.parts.at(-1).to.plannedDeparture)) >= AUTO_ALT_DELAY_MIN;
-  const trouble = conn.cancelled || delayed || active.length > 0;
+  const trouble = conn.cancelled || delayed || incidents.length > 0;
   const key = `${conn.key}|${pos.partIdx}|${pos.seg}`;
   if (trouble && state.altKey !== key) runAlternatives();
 }
@@ -450,11 +481,13 @@ function render() {
     <div class="muted">${esc(destTo.name)}</div>
     <div style="margin-top:6px">${where} <span class="muted small">(${source})</span></div>`;
 
-  const { active, planned } = relevantMessages(state.messages, conn, now);
-  $('#alerts').innerHTML = [
-    ...active.map((m) => alertHtml(m, false)),
-    ...planned.map((m) => alertHtml(m, true)),
-  ].join('');
+  const { incidents, notices } = relevantMessages(state.messages, conn, now);
+  const openNotices = $('#alerts .notices')?.open ? ' open' : '';
+  $('#alerts').innerHTML = incidents.map(alertHtml).join('') + (notices.length ? `
+    <details class="notices card"${openNotices}>
+      <summary>${notices.length} ${notices.length === 1 ? 'Hinweis' : 'Hinweise'} zu Baustellen &amp; Fahrplanänderungen</summary>
+      ${notices.map(noticeHtml).join('')}
+    </details>` : '');
 
   $('#stops').innerHTML = stops.map((s, i) => {
     const cls = i <= pos.seg ? 'past' : i === pos.seg + 1 ? 'next' : '';
@@ -465,10 +498,18 @@ function render() {
   renderMap(conn, pos, stops);
 }
 
-function alertHtml(m, isPlanned) {
+function alertHtml(m) {
   const text = htmlToText(m.description ?? m.text ?? '');
-  return `<div class="alert ${isPlanned ? 'planned' : ''}">
-    <h3>${isPlanned ? 'Geplant: ' : ''}${esc(m.title ?? htmlToText(m.text) ?? 'Hinweis')}</h3>
+  return `<div class="alert">
+    <h3>${esc(m.title ?? htmlToText(m.text) ?? 'Störung')}</h3>
+    ${text ? `<details><summary>Details</summary>${esc(text)}</details>` : ''}
+  </div>`;
+}
+
+function noticeHtml(m) {
+  const text = htmlToText(m.description ?? '');
+  return `<div class="notice">
+    <b>${m.upcoming ? 'Ab demnächst: ' : ''}${esc(htmlToText(m.title))}</b>
     ${text ? `<details><summary>Details</summary>${esc(text)}</details>` : ''}
   </div>`;
 }

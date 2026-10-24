@@ -1,7 +1,7 @@
 // MVV4Dummies – Fahrtbegleiter für MVV/MVG.
 // Datenquelle: MVG-Fahrplanauskunft (inoffiziell, erlaubt CORS-Abfragen direkt aus dem Browser).
 
-const APP_VERSION = '0.5.1';       // bei jeder Änderung erhöhen, auch 3× in index.html; steht neben dem Titel
+const APP_VERSION = '0.5.2';       // bei jeder Änderung erhöhen, auch 3× in index.html; steht neben dem Titel
 const API = 'https://www.mvg.de/api/bgw-pt/v3';
 const TRANSPORT_TYPES = 'SCHIFF,RUFTAXI,BAHN,UBAHN,TRAM,SBAHN,BUS,REGIONAL_BUS';
 const REFRESH_MS = 30_000;
@@ -585,12 +585,12 @@ function optionHtml(o, base) {
   const gainText = gain > 0 ? `${gain} min schneller` : gain < 0 ? `${-gain} min später` : 'gleich schnell';
   const buffer = minutes(o.buffer);
   const missText = o.fallback
-    ? `verpasst: an ${fmtTime(o.fallback.arrive)} (+${minutes(o.fallback.arrive - o.conn.arrive)} min)`
+    ? `verpasst: 🎯 ${fmtTime(o.fallback.arrive)} (+${minutes(o.fallback.arrive - o.conn.arrive)} min)`
     : 'verpasst: keine spätere Verbindung';
   const n = transfers(o.conn) + 1;   // +1: aus dem jetzigen Zug aussteigen
   const idx = state.alternatives.options.indexOf(o);
   return `<div class="alt ${gain > 0 ? 'better' : ''} ${state.selected === o ? 'selected' : ''}" data-idx="${idx}" role="button">
-    <div class="row between"><span class="head">an ${fmtTime(o.conn.arrive)} · ${durText(o.conn.arrive - Date.now())}</span><span class="${gain > 0 ? 'ontime' : 'muted'}">${gainText}</span></div>
+    <div class="row between"><span class="head">🎯 ${fmtTime(o.conn.arrive)} · ${durText(o.conn.arrive - Date.now())}</span><span class="${gain > 0 ? 'ontime' : 'muted'}">${gainText}</span></div>
     <div class="chips">${badge(state.alternatives.line)}<span class="sep">›</span>${chips(o.conn)}</div>
     <div class="legs">Aussteigen in <b>${esc(o.exit.name)}</b> (${fmtTime(o.reach)}) · ${legsText(o.conn)} · ${n} Umstieg${n > 1 ? 'e' : ''}</div>
     <div class="risk">Umstiegszeit ${buffer} min${buffer <= MIN_TRANSFER_MIN + 1 ? ' – knapp!' : ''} · ${missText}</div>
@@ -604,7 +604,7 @@ function renderAlternatives(showAll = false) {
   const base = alt.base;
   const stayLabel = base.parts.filter(isTransit).length > 1 ? 'Wie geplant' : 'Sitzen bleiben';
   const html = [`<div class="alt stay ${state.selected ? '' : 'selected'}" data-idx="-1" role="button">
-    <div class="row between"><span class="head">${stayLabel}: an ${fmtTime(base.arrive)} · ${durText(base.arrive - Date.now())}</span></div>
+    <div class="row between"><span class="head">${stayLabel}: 🎯 ${fmtTime(base.arrive)} · ${durText(base.arrive - Date.now())}</span></div>
     <div class="chips">${chips(base)}</div>
     ${troubleBadge(base)}
   </div>`];
@@ -715,10 +715,10 @@ function renderMap(conn, pos, stops) {
     }
     pin(opt.exit, `Aussteigen ${fmtTime(opt.reach)}`, '#e8710a');
     opt.conn.parts.filter(isTransit).slice(1).forEach((p) => pin(p.from, `Umsteigen ${fmtTime(depTime(p.from))}`, '#e8710a'));
-    pin(opt.conn.parts.at(-1).to, `Ziel ${fmtTime(opt.conn.arrive)}`, '#1e7d3a');
+    pin(opt.conn.parts.at(-1).to, `🎯 ${fmtTime(opt.conn.arrive)}`, '#1e7d3a');
     if (state.fitSelection && optBounds.length) state.map.fitBounds(optBounds, { padding: [40, 40] });
     const legsSummary = opt.conn.parts.map((p) => `${isTransit(p) ? esc(p.line.label) : '🚶'} ${durText(arrTime(p.to) - depTime(p.from))}`).join(' › ');
-    caption = `<b>Option:</b> an ${fmtTime(opt.conn.arrive)} · ${durText(opt.conn.arrive - Date.now())} ab jetzt<br>
+    caption = `<b>Option:</b> 🎯 ${fmtTime(opt.conn.arrive)} · ${durText(opt.conn.arrive - Date.now())} ab jetzt<br>
       ${esc(rideText)} bis ${esc(opt.exit.name)} › ${durText(opt.buffer)} warten › ${legsSummary}
       · <a href="#" id="clear-option">Zurück zum Plan</a>`;
   } else if (state.fitSelection && bounds.length) {

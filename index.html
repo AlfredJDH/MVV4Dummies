@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>MVV4Dummies</title>
+  <meta name="description" content="Wo bin ich, was ist gestört, lohnt sich Umsteigen?">
+  <meta name="theme-color" content="#0b5fa5">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="MVV4Dummies">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <button id="back" class="icon-btn" hidden aria-label="Zurück">‹</button>
+    <h1>MVV4Dummies</h1>
+    <span id="updated" class="muted small"></span>
+  </header>
+
+  <main id="home">
+    <section class="card">
+      <h2>Meine Fahrten</h2>
+      <ul id="favorites" class="fav-list"></ul>
+    </section>
+
+    <section class="card">
+      <h2>Neue Fahrt</h2>
+      <label class="field">Von
+        <input id="from-input" autocomplete="off" placeholder="z. B. Aying">
+        <ul class="suggestions" id="from-suggest"></ul>
+      </label>
+      <label class="field">Nach
+        <input id="to-input" autocomplete="off" placeholder="z. B. Ostbahnhof">
+        <ul class="suggestions" id="to-suggest"></ul>
+      </label>
+      <div class="row">
+        <button id="start-new" class="primary" disabled>Losfahren</button>
+        <button id="save-new" disabled>Als Favorit speichern</button>
+      </div>
+    </section>
+
+    <p class="muted small footnote">
+      Daten: MVG/MVV (inoffizielle Schnittstelle, ohne Gewähr). Standort wird nur auf deinem
+      Gerät verwendet und nirgends gespeichert.
+    </p>
+  </main>
+
+  <main id="trip" hidden>
+    <section id="status" class="card status"></section>
+    <section id="alerts"></section>
+    <div id="map" class="map"></div>
+    <section class="card">
+      <div class="row between">
+        <h2>Alternativen</h2>
+        <button id="check-alt">Prüfen</button>
+      </div>
+      <div id="alternatives" class="muted small">Wird automatisch geprüft, sobald dein Zug gestört oder verspätet ist.</div>
+    </section>
+    <section class="card">
+      <h2>Halte</h2>
+      <ol id="stops" class="stops"></ol>
+    </section>
+    <section class="card">
+      <div class="row">
+        <button id="other-train">Anderer Zug?</button>
+        <button id="stop-trip">Fahrt beenden</button>
+      </div>
+      <p id="position-hint" class="muted small"></p>
+    </section>
+  </main>
+
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

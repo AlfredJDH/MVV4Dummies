@@ -1,7 +1,7 @@
 // MVV4Dummies – Fahrtbegleiter für MVV/MVG.
 // Datenquelle: MVG-Fahrplanauskunft (inoffiziell, erlaubt CORS-Abfragen direkt aus dem Browser).
 
-const APP_VERSION = '0.5.4';       // bei jeder Änderung erhöhen, auch 3× in index.html; steht neben dem Titel
+const APP_VERSION = '0.5.5';       // bei jeder Änderung erhöhen, auch 3× in index.html; steht neben dem Titel
 const API = 'https://www.mvg.de/api/bgw-pt/v3';
 const TRANSPORT_TYPES = 'SCHIFF,RUFTAXI,BAHN,UBAHN,TRAM,SBAHN,BUS,REGIONAL_BUS';
 const REFRESH_MS = 30_000;
@@ -334,6 +334,65 @@ function transferSteps(opt) {
 
 const isTight = (step) => minutes(step.wait + step.walk) <= MIN_TRANSFER_MIN + 1;
 
+// ---------- Takt ----------
+
+const NICE_HEADWAYS = [2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 30, 40, 60];
+const departuresCache = new Map();
+
+// Abfahrten an einem Halt in einem ~40-min-Fenster ab "time" (zwei Seiten à 20 min, die API liefert max. 30 Einträge).
+function departuresAround(stationId, transportType, time) {
+  const bucket = Math.max(0, Math.floor((time - Date.now()) / 600_000) * 10);
+  const key = `${stationId}|${transportType}|${bucket}`;
+  const hit = departuresCache.get(key);
+  if (hit && Date.now() - hit.at < 5 * 60_000) return hit.promise;
+  const page = (offset) => api('/departures', { globalId: stationId, limit: 80, offsetInMinutes: offset, transportTypes: transportType }).catch(() => []);
+  const promise = Promise.all([page(bucket), page(bucket + 20)]).then(([a, b]) => {
+    const unique = new Map();
+    for (const d of [...a, ...b]) unique.set(`${d.label}|${d.destination}|${d.plannedDepartureTime}`, d);
+    return [...unique.values()];
+  });
+  departuresCache.set(key, { at: Date.now(), promise });
+  return promise;
+}
+
+// Takt in Minuten (auf übliche Werte gerundet), Infinity = fährt selten, null = unbekannt.
+async function headwayAt(stop, line) {
+  const deps = await departuresAround(stop.stationGlobalId, line.transportType, depTime(stop));
+  const times = deps
+    .filter((d) => d.label === line.label && normName(d.destination) === normName(line.destination))
+    .map((d) => d.plannedDepartureTime)
+    .sort((a, b) => a - b);
+  if (!times.length) return null;
+  if (times.length === 1) return Infinity;
+  const avg = (times.at(-1) - times[0]) / (times.length - 1) / 60_000;
+  return NICE_HEADWAYS.reduce((a, b) => (Math.abs(b - avg) < Math.abs(a - avg) ? b : a));
+}
+
+const headwayKey = (stop, line) => `${stop.stationGlobalId}|${line.label}|${line.destination}`;
+
+function taktText(stop, line) {
+  const h = state.takt.get(headwayKey(stop, line));
+  if (h === undefined || h === null) return '';
+  return h === Infinity ? 'selten' : `alle ${h} min`;
+}
+
+// Takt für alle Umstiege der angezeigten Optionen nachladen, dann neu zeichnen.
+async function loadHeadways(options) {
+  const jobs = new Map();
+  for (const o of options) for (const st of transferSteps(o)) {
+    const key = headwayKey(st.stop, st.line);
+    if (!state.takt.has(key) && !jobs.has(key)) jobs.set(key, () => headwayAt(st.stop, st.line));
+  }
+  if (!jobs.size) return;
+  const entries = [...jobs];
+  for (let i = 0; i < entries.length; i += ALT_PARALLEL) {
+    await Promise.all(entries.slice(i, i + ALT_PARALLEL).map(async ([key, job]) => {
+      try { state.takt.set(key, await job()); } catch { state.takt.set(key, null); }
+    }));
+  }
+  if (state.alternatives) { renderAlternatives(state.showAllAlt); render(); }
+}
+
 function stepText(step) {
   const walk = step.walk > 0 ? `🚶 ${durText(step.walk)} + ` : '';
   return `${walk}⏳ ${durText(step.wait)}${isTight(step) ? ' – knapp!' : ''}`;
@@ -352,6 +411,8 @@ const state = {
   messagesAt: 0,
   alternatives: null,
   selected: null,    // in der Karte gezeigte Option
+  showAllAlt: false,
+  takt: new Map(),   // Halt|Linie|Richtung -> Takt in Minuten
   altKey: null,
   timer: null,
   watchId: null,
@@ -517,6 +578,7 @@ async function runAlternatives() {
     $('#alternatives').innerHTML = `<span class="muted">Prüfe Halte … ${done}/${total}</span>`;
   });
   renderAlternatives();
+  loadHeadways(state.alternatives.options.slice(0, ALT_SHOWN));
 }
 
 // ---------- Darstellung ----------
@@ -615,13 +677,14 @@ function optionHtml(o, base) {
     <div class="chips">${badge(state.alternatives.line)}<span class="sep">›</span>${chips(o.conn)}</div>
     <div class="legs">Aussteigen in <b>${esc(o.exit.name)}</b> (${fmtTime(o.reach)}) · ${legsText(o.conn)} · ${n} Umstieg${n > 1 ? 'e' : ''}</div>
     <div class="transfers">${transferSteps(o).map((st) =>
-      `<span class="${isTight(st) ? 'tight' : ''}">${esc(st.stop.name)} → ${esc(st.line.label)}: ${stepText(st)}</span>`).join('')}</div>
+      `<span class="${isTight(st) ? 'tight' : ''}">${esc(st.stop.name)} → ${esc(st.line.label)}${taktText(st.stop, st.line) ? ` (${taktText(st.stop, st.line)})` : ''}: ${stepText(st)}</span>`).join('')}</div>
     <div class="risk">Ersten Anschluss ${missText}</div>
     ${troubleBadge(o.conn)}
   </div>`;
 }
 
 function renderAlternatives(showAll = false) {
+  state.showAllAlt = showAll;
   const alt = state.alternatives;
   if (!alt) return;
   const base = alt.base;
@@ -639,7 +702,7 @@ function renderAlternatives(showAll = false) {
   html.push(`<div class="muted small" style="margin-top:6px">Geprüft: ${alt.checked} Halte · Stand ${fmtTime(Date.now())}. Prognosen bei Störungen sind oft ungenau.</div>`);
   if (alt.options.length) html.push('<div class="muted small">Tippe auf eine Option, um sie in der Karte zu sehen.</div>');
   $('#alternatives').innerHTML = html.join('');
-  $('#more-alt')?.addEventListener('click', () => renderAlternatives(true));
+  $('#more-alt')?.addEventListener('click', () => { renderAlternatives(true); loadHeadways(alt.options); });
   for (const card of document.querySelectorAll('#alternatives .alt[data-idx]')) {
     card.addEventListener('click', () => selectOption(Number(card.dataset.idx), showAll));
   }
@@ -744,16 +807,15 @@ function renderMap(conn, pos, stops) {
     const from = Math.max(0, pos.seg), fromIdx = nearestIndex(basePts, stops[from]);
     const exitIdx = nearestIndex(basePts, opt.exit);
     const ridePts = basePts.slice(Math.min(fromIdx, exitIdx), Math.max(fromIdx, exitIdx) + 1);
-    const rideStart = pos.seg < 0 ? depTime(stops[0]) : Date.now();
-    const rideText = `${part.line.label} · ${durText(opt.reach - rideStart)}`;
-    drawLeg(ridePts, partColor(part), rideText);
+    drawLeg(ridePts, partColor(part), part.line.label);
     // Zoomen auf den neuen Teil ab dem Ausstieg, damit die Etiketten lesbar bleiben
     optBounds.push([opt.exit.latitude, opt.exit.longitude]);
     // Die Abschnitte der Option
     for (const p of opt.conn.parts) {
       const pts = partPoints(p);
-      const dur = durText(arrTime(p.to) - depTime(p.from));
-      drawLeg(pts, partColor(p), isTransit(p) ? `${p.line.label} · ${dur}` : `🚶 ${dur}`, isTransit(p) ? {} : { dashArray: '4 8', weight: 4 });
+      const takt = isTransit(p) ? taktText(p.from, p.line) : '';
+      const label = isTransit(p) ? `${p.line.label}${takt ? ` · ${takt}` : ''}` : `🚶 ${durText(arrTime(p.to) - depTime(p.from))}`;
+      drawLeg(pts, partColor(p), label, isTransit(p) ? {} : { dashArray: '4 8', weight: 4 });
       optBounds.push(...pts);
     }
     const steps = transferSteps(opt);
@@ -771,14 +833,16 @@ function renderMap(conn, pos, stops) {
     const flow = [];
     let si = 0;
     for (const p of opt.conn.parts) {
-      const dur = durText(arrTime(p.to) - depTime(p.from));
-      if (!isTransit(p)) { flow.push(`🚶 ${dur}`); continue; }
+      if (!isTransit(p)) { flow.push(`🚶 ${durText(arrTime(p.to) - depTime(p.from))}`); continue; }
       const st = steps[si++];
-      flow.push(`<span class="${isTight(st) ? 'tight' : ''}">⏳ ${durText(st.wait)}</span>`, `${esc(p.line.label)} ${dur}`);
+      const takt = taktText(p.from, p.line);
+      flow.push(`<span class="${isTight(st) ? 'tight' : ''}">⏳ ${durText(st.wait)}</span>`,
+        `${esc(p.line.label)} 🚀 ${fmtTime(depTime(p.from))}${takt ? ` (${takt})` : ''}`);
     }
+    flow.push(`🎯 ${fmtTime(opt.conn.arrive)}`);
     const legsSummary = flow.join(' › ');
     caption = `<b>Option:</b> 🎯 ${fmtTime(opt.conn.arrive)} · noch ${durText(opt.conn.arrive - Date.now())}<br>
-      ${esc(rideText)} bis ${esc(opt.exit.name)} › ${legsSummary}
+      ${esc(part.line.label)} bis ${esc(opt.exit.name)} 🎯 ${fmtTime(opt.reach)} › ${legsSummary}
       · <a href="#" id="clear-option">Zurück zum Plan</a>`;
   } else if (state.fitSelection && bounds.length) {
     state.map.fitBounds(bounds, { padding: [20, 20] });

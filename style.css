@@ -142,3 +142,5 @@ button.more { width: 100%; margin-top: 8px; }
 }
 .leaflet-tooltip.leg-label::before { display: none; }
 .leaflet-tooltip.stop-label { font-size: 12px; padding: 2px 6px; font-weight: 600; }
+
+.version { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 4px; }
